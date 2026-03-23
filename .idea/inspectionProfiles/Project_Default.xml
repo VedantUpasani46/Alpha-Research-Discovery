@@ -1,0 +1,66 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyClassicStyleClassInspection" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="PyCompatibilityInspection" enabled="true" level="ERROR" enabled_by_default="true" editorAttributes="ERRORS_ATTRIBUTES">
+      <option name="ourVersions">
+        <value>
+          <list size="11">
+            <item index="0" class="java.lang.String" itemvalue="2.7" />
+            <item index="1" class="java.lang.String" itemvalue="3.5" />
+            <item index="2" class="java.lang.String" itemvalue="3.6" />
+            <item index="3" class="java.lang.String" itemvalue="3.7" />
+            <item index="4" class="java.lang.String" itemvalue="3.8" />
+            <item index="5" class="java.lang.String" itemvalue="3.9" />
+            <item index="6" class="java.lang.String" itemvalue="3.10" />
+            <item index="7" class="java.lang.String" itemvalue="3.11" />
+            <item index="8" class="java.lang.String" itemvalue="3.12" />
+            <item index="9" class="java.lang.String" itemvalue="3.13" />
+            <item index="10" class="java.lang.String" itemvalue="3.14" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="false" level="WARNING" enabled_by_default="false">
+      <option name="ignoredPackages">
+        <list>
+          <option value="numpy" />
+          <option value="pandas" />
+          <option value="scipy" />
+          <option value="scikit-learn" />
+          <option value="xgboost" />
+          <option value="torch" />
+          <option value="transformers" />
+          <option value="QuantLib" />
+          <option value="ta-lib" />
+          <option value="matplotlib" />
+          <option value="seaborn" />
+          <option value="nltk" />
+          <option value="spacy" />
+          <option value="tqdm" />
+          <option value="requests" />
+          <option value="lightgbm" />
+          <option value="QuantLib-Python" />
+          <option value="statsmodels" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyPep8NamingInspection" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <option name="ignoredErrors">
+        <list>
+          <option value="N802" />
+          <option value="N803" />
+          <option value="N806" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyTypeCheckerInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="datetime.time.*" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
