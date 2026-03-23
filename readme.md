@@ -10,8 +10,6 @@
 > from first principles, validated against real market data (Yahoo Finance, CBOE, Binance, Deribit),
 > with full mathematical derivations and walk-forward out-of-sample testing.
 >
-> Combined codebase across all 4 repositories: **~115,000 lines of production Python.**
-
 ---
 
 ## Quick Stats
