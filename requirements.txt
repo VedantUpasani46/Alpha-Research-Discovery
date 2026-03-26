@@ -1,0 +1,44 @@
+# Alpha-Research-Discovery — Complete dependency list
+# ──────────────────────────────────────────────────────
+# Core scientific stack
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+statsmodels>=0.14
+
+# Gradient boosting (Alpha 08, etc.)
+xgboost>=2.0
+lightgbm>=4.0
+
+# Regime detection (Alpha 09)
+hmmlearn>=0.3
+
+# Kalman filter (Alpha 10)
+filterpy>=1.4
+
+# NLP / Sentiment (Alpha 11, 19)
+transformers>=4.30
+torch>=2.0
+nltk>=3.8
+
+# Google Trends (Alpha 12)
+pytrends>=4.9
+
+# Crypto on-chain data (Alpha 15, 16)
+requests>=2.31
+
+# Options data (Alpha 17, 18, 20, 27)
+# (Uses Yahoo Finance / CBOE public data via pandas)
+
+# Visualisation
+matplotlib>=3.7
+seaborn>=0.13
+
+# Data fetching
+yfinance>=0.2.31
+pandas-datareader>=0.10
+
+# Utilities
+tqdm>=4.66
+joblib>=1.3
