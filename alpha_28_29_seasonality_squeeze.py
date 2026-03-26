@@ -511,5 +511,4 @@ def run_alpha29(tickers=None, start=_DEFAULT_START, end=_DEFAULT_END):
     row.to_csv(csv); return a
 
 
-if __name__ == "__main__" and False:  # run directly via alpha_29
-    pass
+if __name__ == "__main__"
