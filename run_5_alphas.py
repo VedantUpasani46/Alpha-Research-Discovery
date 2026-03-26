@@ -1,5 +1,5 @@
 """
-run_all_alphas.py
+run_first-5-alphas.py
 ──────────────────
 Master runner: executes Alpha 01–05 sequentially and
 generates the combined performance summary table.
