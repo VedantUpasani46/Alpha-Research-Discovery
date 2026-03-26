@@ -1,662 +1,615 @@
 """
-data_fetcher.py
-───────────────
-Unified data-access layer for the AI-Alpha-Factory.
-Pulls from:
-  • Yahoo Finance  (yfinance)         — daily OHLCV, macro ETFs
-  • Binance REST   (python-binance)   — crypto OHLCV, funding rates, OI
-  • CBOE / Deribit                    — options surfaces (stubs, extend as needed)
+Data Fetcher
+=============
 
-All data is cached locally as parquet files under ./cache/ to avoid redundant
-network calls.  Every alpha module imports DataFetcher and nothing else.
+Flexible, production-quality data acquisition layer with caching, rate
+limiting, and validation.
 
-Author : AI-Alpha-Factory
-Version: 1.0.0
+Supported backends
+------------------
+* **Yahoo Finance** — equities, ETFs, indices via ``yfinance``.
+* **Binance** — crypto spot markets via ``ccxt``.
+* **Simulated / synthetic** — generate realistic price series for testing.
+
+Usage
+-----
+.. code-block:: python
+
+    fetcher = DataFetcher(source="yahoo", cache_dir="./cache")
+    prices = fetcher.get_prices(["AAPL", "MSFT"], start="2020-01-01")
+    returns = fetcher.get_returns(["AAPL", "MSFT"], start="2020-01-01")
+
+All fetched data is automatically cached to disk (Parquet format) so that
+repeated requests do not hit the API.
 """
 
 from __future__ import annotations
 
-import os
 import hashlib
 import logging
+import os
 import time
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
-warnings.filterwarnings("ignore")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-)
-log = logging.getLogger("DataFetcher")
+logger = logging.getLogger(__name__)
 
-# ── optional imports (graceful degradation) ──────────────────────────────────
-try:
-    import yfinance as yf
-    _YF_AVAILABLE = True
-except ImportError:
-    _YF_AVAILABLE = False
-    log.warning("yfinance not installed — equity data unavailable")
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-try:
-    import requests
-    _REQUESTS_AVAILABLE = True
-except ImportError:
-    _REQUESTS_AVAILABLE = False
-    log.warning("requests not installed — Binance REST unavailable")
-
-CACHE_DIR = Path("./cache")
-CACHE_DIR.mkdir(exist_ok=True)
-
-# ── constants ─────────────────────────────────────────────────────────────────
-BINANCE_BASE = "https://api.binance.com"
-BINANCE_FAPI = "https://fapi.binance.com"   # futures
-
-SP500_TICKERS: List[str] = [
-    "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","BRK-B","JPM","V",
-    "UNH","XOM","LLY","JNJ","WMT","MA","PG","HD","CVX","MRK","ABBV","KO",
-    "AVGO","PEP","COST","ADBE","CSCO","MCD","TMO","ACN","NEE","DHR","ABT",
-    "CRM","LIN","NKE","TXN","PM","ORCL","MS","BAC","AMGN","RTX","HON",
-    "INTU","QCOM","AMD","SBUX","T","GS","CAT","BA","LOW","SPGI","AXP",
-    "BLK","ISRG","DE","MDLZ","GILD","SYK","ADI","BKNG","REGN","PLD",
-    "MMM","VRTX","CB","C","TJX","ZTS","MO","ADP","NOW","LRCX","ELV",
-    "CI","SO","DUK","PNC","USB","TGT","EQIX","BSX","BDX","KLAC","MU",
-    "ETN","NOC","ITW","GE","HUM","PANW","F","GM","CARR","FTNT",
-]
-
-CRYPTO_UNIVERSE: List[str] = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","ADAUSDT","XRPUSDT","DOGEUSDT",
-    "AVAXUSDT","DOTUSDT","LINKUSDT","MATICUSDT","LTCUSDT","UNIUSDT","ATOMUSDT",
-    "ETCUSDT","XLMUSDT","ALGOUSDT","VETUSDT","FILUSDT","TRXUSDT",
-]
+_DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".alpha_cache")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-class DataFetcher:
-    """
-    Central data-access class.  All expensive calls are cached to parquet.
+class DataSource(str, Enum):
+    """Supported data backends."""
 
-    Usage
-    -----
-    df = DataFetcher()
-    prices  = df.get_equity_prices(tickers, start, end)
-    crypto  = df.get_crypto_ohlcv("BTCUSDT", "1d", start, end)
-    funding = df.get_funding_rates("BTCUSDT", start, end)
+    YAHOO = "yahoo"
+    BINANCE = "binance"
+    SIMULATED = "simulated"
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+
+class _RateLimiter:
+    """Simple token-bucket rate limiter.
+
+    Parameters
+    ----------
+    calls_per_second : float
+        Maximum calls per second.
     """
 
-    def __init__(self, cache_dir: Path = CACHE_DIR, use_cache: bool = True):
+    def __init__(self, calls_per_second: float = 2.0) -> None:
+        self._min_interval = 1.0 / calls_per_second
+        self._last_call: float = 0.0
+
+    def wait(self) -> None:
+        elapsed = time.monotonic() - self._last_call
+        if elapsed < self._min_interval:
+            time.sleep(self._min_interval - elapsed)
+        self._last_call = time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# Data validation
+# ---------------------------------------------------------------------------
+
+
+class DataValidator:
+    """Validates fetched price / volume data.
+
+    Checks performed:
+    * NaN fraction below threshold.
+    * No duplicate indices.
+    * No large gaps (configurable).
+    * Outlier detection (returns > N sigma).
+    """
+
+    def __init__(
+        self,
+        max_nan_frac: float = 0.05,
+        max_gap_days: int = 5,
+        outlier_sigma: float = 10.0,
+    ) -> None:
+        self.max_nan_frac = max_nan_frac
+        self.max_gap_days = max_gap_days
+        self.outlier_sigma = outlier_sigma
+
+    def validate(self, df: pd.DataFrame, name: str = "data") -> pd.DataFrame:
+        """Run all validation checks.  Returns cleaned DataFrame.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Data to validate.
+        name : str
+            Label for log messages.
+
+        Returns
+        -------
+        pd.DataFrame
+            Cleaned data (duplicates removed, NaN forward-filled up to a
+            limit).
+        """
+        if df.empty:
+            warnings.warn(f"[{name}] DataFrame is empty.")
+            return df
+
+        # 1. Duplicates
+        n_dupes = df.index.duplicated().sum()
+        if n_dupes > 0:
+            logger.warning("[%s] Removing %d duplicate index entries.", name, n_dupes)
+            df = df[~df.index.duplicated(keep="first")]
+
+        # 2. Sort index
+        df = df.sort_index()
+
+        # 3. NaN fraction
+        nan_frac = df.isna().mean()
+        for col in nan_frac.index:
+            if nan_frac[col] > self.max_nan_frac:
+                logger.warning(
+                    "[%s] Column '%s' has %.1f%% NaN (threshold %.1f%%).",
+                    name, col, nan_frac[col] * 100, self.max_nan_frac * 100,
+                )
+
+        # 4. Forward-fill small gaps (up to max_gap_days)
+        df = df.ffill(limit=self.max_gap_days)
+
+        # 5. Gap detection (on DatetimeIndex only)
+        if isinstance(df.index, pd.DatetimeIndex):
+            diffs = df.index.to_series().diff()
+            large_gaps = diffs[diffs > pd.Timedelta(days=self.max_gap_days)]
+            if len(large_gaps) > 0:
+                logger.warning(
+                    "[%s] %d gaps > %d days detected. Largest: %s at %s.",
+                    name,
+                    len(large_gaps),
+                    self.max_gap_days,
+                    large_gaps.max(),
+                    large_gaps.idxmax(),
+                )
+
+        # 6. Outlier detection on returns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            series = df[col].pct_change().dropna()
+            if len(series) < 10:
+                continue
+            mu = series.mean()
+            sigma = series.std()
+            if sigma > 0:
+                z_scores = ((series - mu) / sigma).abs()
+                n_outliers = (z_scores > self.outlier_sigma).sum()
+                if n_outliers > 0:
+                    logger.warning(
+                        "[%s] Column '%s': %d return outliers (|z| > %.1f).",
+                        name, col, n_outliers, self.outlier_sigma,
+                    )
+
+        return df
+
+
+# ---------------------------------------------------------------------------
+# Cache layer
+# ---------------------------------------------------------------------------
+
+
+class _CacheManager:
+    """Disk-based caching using Parquet files."""
+
+    def __init__(self, cache_dir: str) -> None:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.use_cache = use_cache
-        log.info("DataFetcher initialised | cache=%s", self.cache_dir)
 
-    # ── helpers ───────────────────────────────────────────────────────────────
+    def _cache_key(self, *args: Any) -> str:
+        raw = "|".join(str(a) for a in args)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    def _cache_path(self, key: str) -> Path:
-        hashed = hashlib.md5(key.encode()).hexdigest()[:12]
-        return self.cache_dir / f"{hashed}.parquet"
-
-    def _load_cache(self, key: str) -> Optional[pd.DataFrame]:
-        path = self._cache_path(key)
-        if self.use_cache and path.exists():
-            age_hours = (time.time() - path.stat().st_mtime) / 3600
-            if age_hours < 24:
-                log.debug("Cache hit  [%s] age=%.1fh", key[:40], age_hours)
-                return pd.read_parquet(path)
+    def get(self, *args: Any) -> Optional[pd.DataFrame]:
+        key = self._cache_key(*args)
+        path = self.cache_dir / f"{key}.parquet"
+        if path.exists():
+            logger.debug("Cache hit: %s", path)
+            return pd.read_parquet(path)
         return None
 
-    def _save_cache(self, key: str, df: pd.DataFrame) -> None:
-        if not df.empty:
-            df.to_parquet(self._cache_path(key))
+    def put(self, df: pd.DataFrame, *args: Any) -> None:
+        key = self._cache_key(*args)
+        path = self.cache_dir / f"{key}.parquet"
+        df.to_parquet(path)
+        logger.debug("Cached to: %s", path)
 
-    # ── equity data via yfinance ──────────────────────────────────────────────
+    def clear(self) -> int:
+        """Remove all cached files.  Returns count deleted."""
+        count = 0
+        for f in self.cache_dir.glob("*.parquet"):
+            f.unlink()
+            count += 1
+        logger.info("Cleared %d cached files.", count)
+        return count
 
-    def get_equity_prices(
+
+# ---------------------------------------------------------------------------
+# DataFetcher
+# ---------------------------------------------------------------------------
+
+
+class DataFetcher:
+    """Unified data fetcher with caching, rate limiting, and validation.
+
+    Parameters
+    ----------
+    source : DataSource or str
+        Backend to use: ``"yahoo"``, ``"binance"``, or ``"simulated"``.
+    cache_dir : str
+        Directory for the Parquet cache.  Default ``~/.alpha_cache``.
+    rate_limit : float
+        Maximum API calls per second (default 2.0).
+    validate : bool
+        Run automatic data validation (default True).
+    timezone_out : str
+        Output timezone for timestamps (default ``"UTC"``).
+
+    Examples
+    --------
+    >>> fetcher = DataFetcher("yahoo")
+    >>> prices = fetcher.get_prices(["AAPL"], start="2023-01-01")
+    >>> fetcher.clear_cache()
+    """
+
+    def __init__(
         self,
-        tickers: List[str],
-        start: str,
-        end: str,
-        field: str = "Adj Close",
+        source: Union[DataSource, str] = DataSource.YAHOO,
+        cache_dir: str = _DEFAULT_CACHE_DIR,
+        rate_limit: float = 2.0,
+        validate: bool = True,
+        timezone_out: str = "UTC",
+    ) -> None:
+        self.source = DataSource(source)
+        self.cache = _CacheManager(cache_dir)
+        self.limiter = _RateLimiter(rate_limit)
+        self.validator = DataValidator() if validate else None
+        self.timezone_out = timezone_out
+
+    # -- Public API ----------------------------------------------------------
+
+    def get_prices(
+        self,
+        symbols: Union[str, Sequence[str]],
+        start: str = "2015-01-01",
+        end: Optional[str] = None,
+        interval: str = "1d",
+        columns: Optional[List[str]] = None,
     ) -> pd.DataFrame:
+        """Fetch OHLCV price data.
+
+        Parameters
+        ----------
+        symbols : str or list[str]
+            Ticker(s) to fetch.
+        start : str
+            Start date (ISO format).
+        end : str or None
+            End date.  Defaults to today.
+        interval : str
+            Bar interval (e.g. ``"1d"``, ``"1h"``).
+        columns : list[str] or None
+            Subset of columns to return.  Default returns all OHLCV columns.
+
+        Returns
+        -------
+        pd.DataFrame
+            Multi-index (date, symbol) or simple DatetimeIndex if single
+            symbol.  Columns: Open, High, Low, Close, Volume (at minimum).
         """
-        Returns a (date × ticker) DataFrame of adjusted close prices.
-        Also caches raw OHLCV per ticker for volume-based alphas.
-        """
-        if not _YF_AVAILABLE:
-            raise ImportError("yfinance required for equity data")
+        symbols = [symbols] if isinstance(symbols, str) else list(symbols)
+        end = end or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        cache_key = f"equity_prices|{'_'.join(sorted(tickers))}|{start}|{end}|{field}"
-        cached = self._load_cache(cache_key)
-        if cached is not None:
-            return cached
-
-        log.info("Downloading equity prices | tickers=%d | %s → %s", len(tickers), start, end)
-        raw = yf.download(
-            tickers,
-            start=start,
-            end=end,
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-        if isinstance(raw.columns, pd.MultiIndex):
-            prices = raw["Close"]
-        else:
-            prices = raw[["Close"]]
-            prices.columns = tickers
-
-        prices.index = pd.to_datetime(prices.index)
-        prices.dropna(how="all", inplace=True)
-        self._save_cache(cache_key, prices)
-        return prices
-
-    def get_equity_ohlcv(
-        self,
-        tickers: List[str],
-        start: str,
-        end: str,
-    ) -> Dict[str, pd.DataFrame]:
-        """
-        Returns a dict  ticker → (date × [Open,High,Low,Close,Volume]) DataFrame.
-        """
-        if not _YF_AVAILABLE:
-            raise ImportError("yfinance required")
-
-        cache_key = f"equity_ohlcv|{'_'.join(sorted(tickers))}|{start}|{end}"
-        cached = self._load_cache(cache_key)
-        if cached is not None:
-            # cached as wide frame; rebuild dict
-            result: Dict[str, pd.DataFrame] = {}
-            for t in tickers:
-                cols = [c for c in cached.columns if c.endswith(f"_{t}")]
-                if cols:
-                    sub = cached[cols].copy()
-                    sub.columns = [c.replace(f"_{t}", "") for c in sub.columns]
-                    result[t] = sub
-            return result
-
-        log.info("Downloading equity OHLCV | tickers=%d", len(tickers))
-        raw = yf.download(
-            tickers,
-            start=start,
-            end=end,
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-        result = {}
-        if isinstance(raw.columns, pd.MultiIndex):
-            for t in tickers:
-                if t in raw.columns.get_level_values(1):
-                    df = raw.xs(t, level=1, axis=1)[["Open","High","Low","Close","Volume"]]
-                    df.index = pd.to_datetime(df.index)
-                    result[t] = df.dropna()
-        else:
-            t = tickers[0]
-            result[t] = raw[["Open","High","Low","Close","Volume"]].copy()
-
-        # flatten for caching
-        wide = pd.concat(
-            {t: df.rename(columns={c: f"{c}_{t}" for c in df.columns}) for t, df in result.items()},
-            axis=1,
-        )
-        wide.columns = wide.columns.droplevel(0)
-        self._save_cache(cache_key, wide)
-        return result
-
-    # ── crypto OHLCV via Binance ──────────────────────────────────────────────
-
-    def get_crypto_ohlcv(
-        self,
-        symbol: str,
-        interval: str,
-        start: str,
-        end: str,
-    ) -> pd.DataFrame:
-        """
-        Returns (datetime × [Open,High,Low,Close,Volume]) for a Binance symbol.
-        interval examples: "1m","5m","15m","1h","4h","1d"
-        """
-        if not _REQUESTS_AVAILABLE:
-            raise ImportError("requests required for Binance data")
-
-        cache_key = f"binance_ohlcv|{symbol}|{interval}|{start}|{end}"
-        cached = self._load_cache(cache_key)
-        if cached is not None:
-            return cached
-
-        log.info("Binance OHLCV | %s %s | %s → %s", symbol, interval, start, end)
-        start_ms = int(pd.Timestamp(start).timestamp() * 1000)
-        end_ms   = int(pd.Timestamp(end).timestamp()   * 1000)
-
-        all_candles: List[list] = []
-        limit = 1000
-        current_ms = start_ms
-
-        while current_ms < end_ms:
-            url = f"{BINANCE_BASE}/api/v3/klines"
-            params = {
-                "symbol":    symbol,
-                "interval":  interval,
-                "startTime": current_ms,
-                "endTime":   end_ms,
-                "limit":     limit,
-            }
-            try:
-                resp = requests.get(url, params=params, timeout=15)
-                resp.raise_for_status()
-                candles = resp.json()
-            except Exception as exc:
-                log.error("Binance request failed: %s", exc)
-                break
-
-            if not candles:
-                break
-            all_candles.extend(candles)
-            current_ms = candles[-1][0] + 1
-            if len(candles) < limit:
-                break
-            time.sleep(0.05)   # rate-limit courtesy
-
-        if not all_candles:
-            log.warning("No candles returned for %s %s", symbol, interval)
-            return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
-
-        df = pd.DataFrame(all_candles, columns=[
-            "open_time","Open","High","Low","Close","Volume",
-            "close_time","quote_volume","trades","taker_buy_base",
-            "taker_buy_quote","ignore",
-        ])
-        df["datetime"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-        df.set_index("datetime", inplace=True)
-        df = df[["Open","High","Low","Close","Volume"]].astype(float)
-        df = df[df.index < pd.Timestamp(end, tz="UTC")]
-        self._save_cache(cache_key, df)
-        return df
-
-    def get_crypto_universe_daily(
-        self,
-        symbols: List[str],
-        start: str,
-        end: str,
-    ) -> Dict[str, pd.DataFrame]:
-        """Convenience wrapper — fetches daily OHLCV for a list of crypto symbols."""
-        result: Dict[str, pd.DataFrame] = {}
+        frames = []
         for sym in symbols:
-            try:
-                df = self.get_crypto_ohlcv(sym, "1d", start, end)
+            cached = self.cache.get("prices", self.source.value, sym, start, end, interval)
+            if cached is not None:
+                df = cached
+            else:
+                df = self._fetch_prices(sym, start, end, interval)
                 if not df.empty:
-                    result[sym] = df
-            except Exception as exc:
-                log.warning("Failed to fetch %s: %s", sym, exc)
+                    self.cache.put(df, "prices", self.source.value, sym, start, end, interval)
+
+            if self.validator and not df.empty:
+                df = self.validator.validate(df, name=f"prices:{sym}")
+
+            if not df.empty:
+                df["symbol"] = sym
+                frames.append(df)
+
+        if not frames:
+            logger.warning("No price data returned for %s", symbols)
+            return pd.DataFrame()
+
+        result = pd.concat(frames)
+
+        # Timezone handling
+        if isinstance(result.index, pd.DatetimeIndex):
+            if result.index.tz is None:
+                result.index = result.index.tz_localize("UTC")
+            result.index = result.index.tz_convert(self.timezone_out)
+
+        if columns:
+            available = [c for c in columns if c in result.columns]
+            result = result[available + ["symbol"]]
+
+        if len(symbols) > 1:
+            result = result.reset_index().set_index(["Date", "symbol"]).sort_index()
+
         return result
 
-    # ── funding rates (perpetuals) ────────────────────────────────────────────
-
-    def get_funding_rates(
+    def get_returns(
         self,
-        symbol: str,
-        start: str,
-        end: str,
+        symbols: Union[str, Sequence[str]],
+        start: str = "2015-01-01",
+        end: Optional[str] = None,
+        method: str = "log",
     ) -> pd.DataFrame:
+        """Fetch returns derived from closing prices.
+
+        Parameters
+        ----------
+        symbols : str or list[str]
+        start : str
+        end : str or None
+        method : str
+            ``"log"`` for log returns, ``"simple"`` for arithmetic.
+
+        Returns
+        -------
+        pd.DataFrame
+            Returns with same structure as :meth:`get_prices`.
         """
-        Returns 8-hourly funding rates from Binance perpetual futures.
-        Columns: [fundingRate, markPrice]
-        """
-        if not _REQUESTS_AVAILABLE:
-            raise ImportError("requests required")
+        prices = self.get_prices(symbols, start, end, columns=["Close"])
 
-        cache_key = f"binance_funding|{symbol}|{start}|{end}"
-        cached = self._load_cache(cache_key)
-        if cached is not None:
-            return cached
+        if "symbol" in prices.columns:
+            # Multi-symbol: pivot, compute returns, unpivot
+            pivot = prices.reset_index()
+            if "Date" in pivot.columns and "symbol" in pivot.columns:
+                wide = pivot.pivot(index="Date", columns="symbol", values="Close")
+            else:
+                wide = prices["Close"].unstack("symbol")
 
-        log.info("Fetching funding rates | %s | %s → %s", symbol, start, end)
-        start_ms = int(pd.Timestamp(start).timestamp() * 1000)
-        end_ms   = int(pd.Timestamp(end).timestamp()   * 1000)
-
-        all_rows: List[dict] = []
-        current_ms = start_ms
-
-        while current_ms < end_ms:
-            url = f"{BINANCE_FAPI}/fapi/v1/fundingRate"
-            params = {
-                "symbol":    symbol,
-                "startTime": current_ms,
-                "endTime":   end_ms,
-                "limit":     1000,
-            }
-            try:
-                resp = requests.get(url, params=params, timeout=15)
-                resp.raise_for_status()
-                rows = resp.json()
-            except Exception as exc:
-                log.error("Funding rate request failed: %s", exc)
-                break
-
-            if not rows:
-                break
-            all_rows.extend(rows)
-            current_ms = rows[-1]["fundingTime"] + 1
-            if len(rows) < 1000:
-                break
-            time.sleep(0.05)
-
-        if not all_rows:
-            return pd.DataFrame(columns=["fundingRate","markPrice"])
-
-        df = pd.DataFrame(all_rows)
-        df["datetime"] = pd.to_datetime(df["fundingTime"], unit="ms", utc=True)
-        df.set_index("datetime", inplace=True)
-        df["fundingRate"] = df["fundingRate"].astype(float)
-        df["markPrice"]   = df["markPrice"].astype(float)
-        df = df[["fundingRate","markPrice"]]
-        self._save_cache(cache_key, df)
-        return df
-
-    # ── open interest ─────────────────────────────────────────────────────────
-
-    def get_open_interest_history(
-        self,
-        symbol: str,
-        period: str,
-        start: str,
-        end: str,
-    ) -> pd.DataFrame:
-        """
-        Historical open interest from Binance futures.
-        period: "5m","15m","30m","1h","2h","4h","6h","12h","1d"
-        """
-        if not _REQUESTS_AVAILABLE:
-            raise ImportError("requests required")
-
-        cache_key = f"binance_oi|{symbol}|{period}|{start}|{end}"
-        cached = self._load_cache(cache_key)
-        if cached is not None:
-            return cached
-
-        log.info("Fetching OI history | %s %s", symbol, period)
-        start_ms = int(pd.Timestamp(start).timestamp() * 1000)
-        end_ms   = int(pd.Timestamp(end).timestamp()   * 1000)
-
-        all_rows: List[dict] = []
-        current_ms = start_ms
-
-        while current_ms < end_ms:
-            url = f"{BINANCE_FAPI}/futures/data/openInterestHist"
-            params = {
-                "symbol":    symbol,
-                "period":    period,
-                "startTime": current_ms,
-                "endTime":   end_ms,
-                "limit":     500,
-            }
-            try:
-                resp = requests.get(url, params=params, timeout=15)
-                resp.raise_for_status()
-                rows = resp.json()
-            except Exception as exc:
-                log.error("OI request failed: %s", exc)
-                break
-
-            if not rows or isinstance(rows, dict):
-                break
-            all_rows.extend(rows)
-            current_ms = rows[-1]["timestamp"] + 1
-            if len(rows) < 500:
-                break
-            time.sleep(0.05)
-
-        if not all_rows:
-            return pd.DataFrame(columns=["openInterest","sumOpenInterestValue"])
-
-        df = pd.DataFrame(all_rows)
-        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df.set_index("datetime", inplace=True)
-        df["openInterest"]     = df["sumOpenInterest"].astype(float)
-        df["openInterestUSD"]  = df["sumOpenInterestValue"].astype(float)
-        df = df[["openInterest","openInterestUSD"]]
-        self._save_cache(cache_key, df)
-        return df
-
-    # ── macro / ETF proxies ───────────────────────────────────────────────────
-
-    def get_macro_etfs(self, start: str, end: str) -> pd.DataFrame:
-        """
-        Fetches proxy ETFs for macro regime signals:
-        SPY (equity), TLT (rates), GLD (gold), USO (oil), HYG (credit), UUP (USD).
-        """
-        etfs = ["SPY","TLT","GLD","USO","HYG","UUP","VIX"]
-        try:
-            prices = self.get_equity_prices(etfs, start, end)
-        except Exception as exc:
-            log.warning("Macro ETF fetch partial failure: %s", exc)
-            prices = pd.DataFrame()
-        return prices
-
-    def get_vix(self, start: str, end: str) -> pd.Series:
-        """Returns daily VIX close series."""
-        try:
-            raw = self.get_equity_prices(["^VIX"], start, end)
-            return raw.iloc[:, 0].rename("VIX")
-        except Exception:
-            return pd.Series(dtype=float, name="VIX")
-
-    # ── market-wide returns for beta computation ──────────────────────────────
-
-    def get_market_returns(
-        self,
-        market_ticker: str = "SPY",
-        start: str = "2019-01-01",
-        end: str   = "2024-12-31",
-    ) -> pd.Series:
-        prices = self.get_equity_prices([market_ticker], start, end)
-        col = prices.columns[0]
-        return prices[col].pct_change().dropna().rename("market_return")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Shared utility functions used by every alpha module
-# ══════════════════════════════════════════════════════════════════════════════
-
-def compute_returns(prices: pd.DataFrame, periods: int = 1) -> pd.DataFrame:
-    """Forward log-returns matrix (date × ticker)."""
-    return np.log(prices / prices.shift(periods))
-
-
-def cross_sectional_rank(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize each row to [-1, +1] via rank then rescaling."""
-    ranked = df.rank(axis=1, pct=True)   # [0, 1]
-    return ranked.subtract(0.5).multiply(2)  # [-1, 1]
-
-
-def winsorise(series: pd.Series, lower: float = 0.01, upper: float = 0.99) -> pd.Series:
-    lb = series.quantile(lower)
-    ub = series.quantile(upper)
-    return series.clip(lb, ub)
-
-
-def information_coefficient(
-    signal: pd.Series,
-    fwd_return: pd.Series,
-    method: str = "spearman",
-) -> float:
-    """
-    Spearman or Pearson IC between signal and forward return.
-    Both series must share the same index.
-    """
-    joined = pd.concat([signal.rename("sig"), fwd_return.rename("fwd")], axis=1).dropna()
-    if len(joined) < 5:
-        return np.nan
-    if method == "spearman":
-        return joined["sig"].corr(joined["fwd"], method="spearman")
-    return joined["sig"].corr(joined["fwd"])
-
-
-def information_coefficient_matrix(
-    signals: pd.DataFrame,
-    forward_returns: pd.DataFrame,
-    lags: List[int],
-) -> pd.DataFrame:
-    """
-    Compute IC for each lag.
-    signals/forward_returns: (date × ticker) DataFrames.
-    Returns DataFrame (lag × stats): mean_IC, std_IC, ICIR, t_stat.
-    """
-    rows = []
-    for lag in lags:
-        fwd_lag = forward_returns.shift(-lag)
-        ics = []
-        for date in signals.index:
-            if date not in fwd_lag.index:
-                continue
-            sig_row = signals.loc[date].dropna()
-            fwd_row = fwd_lag.loc[date].dropna()
-            common  = sig_row.index.intersection(fwd_row.index)
-            if len(common) < 5:
-                continue
-            ic = information_coefficient(sig_row[common], fwd_row[common])
-            ics.append(ic)
-        ics_arr = np.array([x for x in ics if not np.isnan(x)])
-        if len(ics_arr) < 3:
-            rows.append({"lag": lag, "mean_IC": np.nan, "std_IC": np.nan, "ICIR": np.nan, "t_stat": np.nan, "n_obs": 0})
-            continue
-        mean_ic = ics_arr.mean()
-        std_ic  = ics_arr.std(ddof=1)
-        icir    = mean_ic / std_ic if std_ic > 0 else np.nan
-        t_stat  = mean_ic / (std_ic / np.sqrt(len(ics_arr))) if std_ic > 0 else np.nan
-        rows.append({"lag": lag, "mean_IC": mean_ic, "std_IC": std_ic, "ICIR": icir, "t_stat": t_stat, "n_obs": len(ics_arr)})
-    return pd.DataFrame(rows).set_index("lag")
-
-
-def compute_max_drawdown(pnl_series: pd.Series) -> float:
-    """Maximum drawdown from cumulative PnL series."""
-    cumulative = pnl_series.cumsum()
-    rolling_max = cumulative.cummax()
-    drawdown = cumulative - rolling_max
-    return float(drawdown.min())
-
-
-def compute_sharpe(returns: pd.Series, periods_per_year: int = 252) -> float:
-    """Annualised Sharpe ratio."""
-    if returns.std() == 0 or returns.empty:
-        return np.nan
-    return float(returns.mean() / returns.std() * np.sqrt(periods_per_year))
-
-
-def compute_turnover(signal_df: pd.DataFrame) -> float:
-    """
-    Average daily turnover as fraction of portfolio that changes.
-    Normalised signal assumed to be in [-1, +1].
-    """
-    delta = signal_df.diff().abs().sum(axis=1)
-    total_long = signal_df.clip(lower=0).sum(axis=1) * 2   # denominator
-    turnover = (delta / total_long.replace(0, np.nan)).dropna()
-    return float(turnover.mean())
-
-
-def long_short_portfolio_returns(
-    signal: pd.DataFrame,
-    returns: pd.DataFrame,
-    top_pct: float = 0.20,
-    transaction_cost_bps: float = 5.0,
-) -> pd.Series:
-    """
-    Each day: long top `top_pct` of signal, short bottom `top_pct`.
-    Returns daily PnL series (long-short, net of transaction costs).
-    """
-    port_returns = []
-    prev_weights: Optional[pd.Series] = None
-
-    for date in signal.index:
-        if date not in returns.index:
-            continue
-        sig_row  = signal.loc[date].dropna()
-        ret_row  = returns.loc[date].dropna()
-        common   = sig_row.index.intersection(ret_row.index)
-        if len(common) < 10:
-            port_returns.append((date, np.nan))
-            continue
-
-        sig   = sig_row[common]
-        rets  = ret_row[common]
-        n     = len(common)
-        n_top = max(1, int(n * top_pct))
-
-        long_assets  = sig.nlargest(n_top).index
-        short_assets = sig.nsmallest(n_top).index
-
-        weights = pd.Series(0.0, index=common)
-        weights[long_assets]  =  1.0 / n_top
-        weights[short_assets] = -1.0 / n_top
-
-        gross_return = (weights * rets).sum()
-
-        # transaction cost
-        if prev_weights is not None:
-            prev_w = prev_weights.reindex(common).fillna(0)
-            turnover = (weights - prev_w).abs().sum() / 2.0
-            cost = turnover * transaction_cost_bps / 10_000
+            if method == "log":
+                ret = np.log(wide / wide.shift(1))
+            else:
+                ret = wide.pct_change()
+            return ret.dropna(how="all")
         else:
-            cost = transaction_cost_bps / 10_000
+            close = prices["Close"] if "Close" in prices.columns else prices.iloc[:, 0]
+            if method == "log":
+                ret = np.log(close / close.shift(1))
+            else:
+                ret = close.pct_change()
+            return ret.dropna().to_frame("return")
 
-        net_return = gross_return - cost
-        port_returns.append((date, net_return))
-        prev_weights = weights
+    def get_volume(
+        self,
+        symbols: Union[str, Sequence[str]],
+        start: str = "2015-01-01",
+        end: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Fetch volume data.
 
-    return pd.Series(
-        {d: v for d, v in port_returns if not np.isnan(v)},
-        name="port_return",
-    )
+        Returns
+        -------
+        pd.DataFrame
+            Volume series.
+        """
+        return self.get_prices(symbols, start, end, columns=["Volume"])
 
+    def get_options_data(
+        self,
+        symbol: str,
+    ) -> pd.DataFrame:
+        """Fetch options chain data (Yahoo Finance only).
 
-def fama_macbeth_regression(
-    signal: pd.DataFrame,
-    forward_returns: pd.DataFrame,
-    lag: int = 1,
-) -> Dict[str, float]:
-    """
-    Fama-MacBeth: run cross-sectional regression each date, return
-    time-series mean and t-stat of the slope coefficient.
-    """
-    from scipy import stats as sp_stats
+        Parameters
+        ----------
+        symbol : str
+            Underlying ticker.
 
-    fwd = forward_returns.shift(-lag)
-    slopes, intercepts = [], []
+        Returns
+        -------
+        pd.DataFrame
+            Concatenated calls and puts with expiration dates.
 
-    for date in signal.index:
-        if date not in fwd.index:
-            continue
-        x = signal.loc[date].dropna()
-        y = fwd.loc[date].dropna()
-        common = x.index.intersection(y.index)
-        if len(common) < 5:
-            continue
-        slope, intercept, *_ = sp_stats.linregress(x[common].values, y[common].values)
-        slopes.append(slope)
-        intercepts.append(intercept)
+        Raises
+        ------
+        NotImplementedError
+            If source is not Yahoo Finance.
+        """
+        if self.source != DataSource.YAHOO:
+            raise NotImplementedError(
+                "Options data is only available from Yahoo Finance."
+            )
 
-    if len(slopes) < 5:
-        return {"gamma": np.nan, "t_stat": np.nan, "n_periods": 0}
+        cached = self.cache.get("options", symbol)
+        if cached is not None:
+            return cached
 
-    arr = np.array(slopes)
-    t_stat = arr.mean() / (arr.std(ddof=1) / np.sqrt(len(arr)))
-    return {
-        "gamma":     float(arr.mean()),
-        "t_stat":    float(t_stat),
-        "n_periods": len(arr),
-    }
+        try:
+            import yfinance as yf
+        except ImportError:
+            raise ImportError("Install yfinance: pip install yfinance")
 
+        self.limiter.wait()
+        ticker = yf.Ticker(symbol)
+        expirations = ticker.options
 
-def walk_forward_split(
-    index: pd.DatetimeIndex,
-    is_frac: float = 0.70,
-) -> Tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
-    """Simple expanding IS/OOS split."""
-    split_idx = int(len(index) * is_frac)
-    return index[:split_idx], index[split_idx:]
+        frames = []
+        for exp in expirations:
+            self.limiter.wait()
+            chain = ticker.option_chain(exp)
+            calls = chain.calls.copy()
+            calls["type"] = "call"
+            calls["expiration"] = exp
+            puts = chain.puts.copy()
+            puts["type"] = "put"
+            puts["expiration"] = exp
+            frames.extend([calls, puts])
+
+        if not frames:
+            logger.warning("No options data for %s.", symbol)
+            return pd.DataFrame()
+
+        result = pd.concat(frames, ignore_index=True)
+        self.cache.put(result, "options", symbol)
+        logger.info("Fetched %d option contracts for %s.", len(result), symbol)
+        return result
+
+    def clear_cache(self) -> int:
+        """Remove all cached data files.
+
+        Returns
+        -------
+        int
+            Number of files deleted.
+        """
+        return self.cache.clear()
+
+    # -- Backend dispatchers -------------------------------------------------
+
+    def _fetch_prices(
+        self, symbol: str, start: str, end: str, interval: str
+    ) -> pd.DataFrame:
+        dispatch = {
+            DataSource.YAHOO: self._fetch_yahoo,
+            DataSource.BINANCE: self._fetch_binance,
+            DataSource.SIMULATED: self._fetch_simulated,
+        }
+        return dispatch[self.source](symbol, start, end, interval)
+
+    # -- Yahoo Finance -------------------------------------------------------
+
+    def _fetch_yahoo(
+        self, symbol: str, start: str, end: str, interval: str
+    ) -> pd.DataFrame:
+        try:
+            import yfinance as yf
+        except ImportError:
+            raise ImportError(
+                "Yahoo Finance backend requires `yfinance`. "
+                "Install with: pip install yfinance"
+            )
+
+        self.limiter.wait()
+        logger.info("Fetching %s from Yahoo Finance (%s to %s).", symbol, start, end)
+
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(start=start, end=end, interval=interval)
+        except Exception as exc:
+            logger.error("Yahoo Finance error for %s: %s", symbol, exc)
+            return pd.DataFrame()
+
+        if df.empty:
+            logger.warning("No data returned for %s.", symbol)
+            return pd.DataFrame()
+
+        # Standardise column names
+        df.columns = [c.title() for c in df.columns]
+        # Keep core columns
+        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        return df[keep]
+
+    # -- Binance (via ccxt) --------------------------------------------------
+
+    def _fetch_binance(
+        self, symbol: str, start: str, end: str, interval: str
+    ) -> pd.DataFrame:
+        try:
+            import ccxt
+        except ImportError:
+            raise ImportError(
+                "Binance backend requires `ccxt`. Install with: pip install ccxt"
+            )
+
+        exchange = ccxt.binance({"enableRateLimit": True})
+
+        since = int(pd.Timestamp(start).timestamp() * 1000)
+        end_ts = int(pd.Timestamp(end).timestamp() * 1000)
+
+        # Map interval string
+        tf_map = {"1d": "1d", "1h": "1h", "4h": "4h", "1w": "1w"}
+        tf = tf_map.get(interval, "1d")
+
+        logger.info("Fetching %s from Binance (%s to %s, tf=%s).", symbol, start, end, tf)
+
+        all_ohlcv: List[list] = []
+        limit = 1000
+
+        while since < end_ts:
+            self.limiter.wait()
+            try:
+                ohlcv = exchange.fetch_ohlcv(symbol, tf, since=since, limit=limit)
+            except Exception as exc:
+                logger.error("Binance error for %s: %s", symbol, exc)
+                break
+
+            if not ohlcv:
+                break
+
+            all_ohlcv.extend(ohlcv)
+            since = ohlcv[-1][0] + 1  # next ms after last candle
+
+        if not all_ohlcv:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            all_ohlcv,
+            columns=["timestamp", "Open", "High", "Low", "Close", "Volume"],
+        )
+        df["Date"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.set_index("Date").drop(columns=["timestamp"])
+        df = df[df.index <= pd.Timestamp(end, tz="UTC")]
+        return df
+
+    # -- Simulated / synthetic data ------------------------------------------
+
+    def _fetch_simulated(
+        self, symbol: str, start: str, end: str, interval: str
+    ) -> pd.DataFrame:
+        """Generate synthetic GBM price series for testing.
+
+        Uses a Geometric Brownian Motion model with parameters derived from
+        the symbol name hash so that each symbol produces a deterministic
+        but distinct series.
+        """
+        logger.info("Generating simulated data for '%s'.", symbol)
+
+        dates = pd.bdate_range(start=start, end=end)
+        T = len(dates)
+        if T == 0:
+            return pd.DataFrame()
+
+        # Deterministic seed from symbol name
+        seed = int(hashlib.md5(symbol.encode()).hexdigest()[:8], 16) % (2 ** 31)
+        rng = np.random.RandomState(seed)
+
+        mu = 0.0002 + rng.uniform(-0.0001, 0.0003)  # daily drift
+        sigma = 0.015 + rng.uniform(0, 0.01)  # daily vol
+        S0 = 50 + rng.uniform(0, 200)
+
+        # GBM
+        dt = 1.0
+        Z = rng.standard_normal(T)
+        log_returns = (mu - 0.5 * sigma ** 2) * dt + sigma * np.sqrt(dt) * Z
+        log_prices = np.log(S0) + np.cumsum(log_returns)
+        close = np.exp(log_prices)
+
+        # Synthetic OHLCV
+        noise = rng.uniform(0.995, 1.005, size=(T, 3))
+        open_ = close * noise[:, 0]
+        high = np.maximum(close, open_) * (1 + rng.uniform(0, 0.01, T))
+        low = np.minimum(close, open_) * (1 - rng.uniform(0, 0.01, T))
+        volume = rng.lognormal(mean=15, sigma=0.5, size=T).astype(int)
+
+        df = pd.DataFrame(
+            {
+                "Open": open_,
+                "High": high,
+                "Low": low,
+                "Close": close,
+                "Volume": volume,
+            },
+            index=dates,
+        )
+        df.index.name = "Date"
+        return df
